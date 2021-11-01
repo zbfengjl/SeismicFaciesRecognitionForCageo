@@ -1,195 +1,244 @@
-import argparse
-import logging
-import sys
-from pathlib import Path
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import wandb
-from torch import optim
-from torch.utils.data import DataLoader, random_split
-from tqdm import tqdm
+import numpy as np
+import pickle
+import deeplab_resnet 
+import cv2
+from torch.autograd import Variable
+import torch.optim as optim
+import scipy.misc
+import torch.backends.cudnn as cudnn
+import sys
+import os
+import matplotlib.pyplot as plt
+from tqdm import *
+import random
+from docopt import docopt
+import timeit
+start = timeit.timeit()
+docstr = """Train ResNet-DeepLab on VOC12 (scenes) in pytorch using MSCOCO pretrained initialization 
 
-from utils.data_loading import BasicDataset, CarvanaDataset
-from utils.dice_score import dice_loss
-from evaluate import evaluate
-from unet import UNet
+Usage: 
+    train.py [options]
 
-dir_img = Path('./data/imgs/')
-dir_mask = Path('./data/masks/')
-dir_checkpoint = Path('./checkpoints/')
+Options:
+    -h, --help                  Print this message
+    --GTpath=<str>              Ground truth path prefix [default: data/gt/]
+    --IMpath=<str>              Sketch images path prefix [default: data/img/]
+    --NoLabels=<int>            The number of different labels in training data, VOC has 21 labels, including background [default: 21]
+    --LISTpath=<str>            Input image number list file [default: data/list/train_aug.txt]
+    --lr=<float>                Learning Rate [default: 0.00025]
+    -i, --iterSize=<int>        Num iters to accumulate gradients over [default: 10]
+    --wtDecay=<float>          Weight decay during training [default: 0.0005]
+    --gpu0=<int>                GPU number [default: 0]
+    --maxIter=<int>             Maximum number of iterations [default: 20000]
+"""
 
+#    -b, --batchSize=<int>       num sample per batch [default: 1] currently only batch size of 1 is implemented, arbitrary batch size to be implemented soon
+args = docopt(docstr, version='v0.1')
+print(args)
 
-def train_net(net,
-              device,
-              epochs: int = 5,
-              batch_size: int = 1,
-              learning_rate: float = 0.001,
-              val_percent: float = 0.1,
-              save_checkpoint: bool = True,
-              img_scale: float = 0.5,
-              amp: bool = False):
-    # 1. Create dataset
-    try:
-        dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
-    except (AssertionError, RuntimeError):
-        dataset = BasicDataset(dir_img, dir_mask, img_scale)
-
-    # 2. Split into train / validation partitions
-    n_val = int(len(dataset) * val_percent)
-    n_train = len(dataset) - n_val
-    train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
-
-    # 3. Create data loaders
-    loader_args = dict(batch_size=batch_size, num_workers=4, pin_memory=True)
-    train_loader = DataLoader(train_set, shuffle=True, **loader_args)
-    val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
-
-    # (Initialize logging)
-    experiment = wandb.init(project='U-Net', resume='allow', anonymous='must')
-    experiment.config.update(dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
-                                  val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale,
-                                  amp=amp))
-
-    logging.info(f'''Starting training:
-        Epochs:          {epochs}
-        Batch size:      {batch_size}
-        Learning rate:   {learning_rate}
-        Training size:   {n_train}
-        Validation size: {n_val}
-        Checkpoints:     {save_checkpoint}
-        Device:          {device.type}
-        Images scaling:  {img_scale}
-        Mixed Precision: {amp}
-    ''')
-
-    # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
-    optimizer = optim.RMSprop(net.parameters(), lr=learning_rate, weight_decay=1e-8, momentum=0.9)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=2)  # goal: maximize Dice score
-    grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
-    criterion = nn.CrossEntropyLoss()
-    global_step = 0
-
-    # 5. Begin training
-    for epoch in range(epochs):
-        net.train()
-        epoch_loss = 0
-        with tqdm(total=n_train, desc=f'Epoch {epoch + 1}/{epochs}', unit='img') as pbar:
-            for batch in train_loader:
-                images = batch['image']
-                true_masks = batch['mask']
-
-                assert images.shape[1] == net.n_channels, \
-                    f'Network has been defined with {net.n_channels} input channels, ' \
-                    f'but loaded images have {images.shape[1]} channels. Please check that ' \
-                    'the images are loaded correctly.'
-
-                images = images.to(device=device, dtype=torch.float32)
-                true_masks = true_masks.to(device=device, dtype=torch.long)
-
-                with torch.cuda.amp.autocast(enabled=amp):
-                    masks_pred = net(images)
-                    loss = criterion(masks_pred, true_masks) \
-                           + dice_loss(F.softmax(masks_pred, dim=1).float(),
-                                       F.one_hot(true_masks, net.n_classes).permute(0, 3, 1, 2).float(),
-                                       multiclass=True)
-
-                optimizer.zero_grad(set_to_none=True)
-                grad_scaler.scale(loss).backward()
-                grad_scaler.step(optimizer)
-                grad_scaler.update()
-
-                pbar.update(images.shape[0])
-                global_step += 1
-                epoch_loss += loss.item()
-                experiment.log({
-                    'train loss': loss.item(),
-                    'step': global_step,
-                    'epoch': epoch
-                })
-                pbar.set_postfix(**{'loss (batch)': loss.item()})
-
-                # Evaluation round
-                division_step = (n_train // (10 * batch_size))
-                if division_step > 0:
-                    if global_step % division_step == 0:
-                        histograms = {}
-                        for tag, value in net.named_parameters():
-                            tag = tag.replace('/', '.')
-                            histograms['Weights/' + tag] = wandb.Histogram(value.data.cpu())
-                            histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
-
-                        val_score = evaluate(net, val_loader, device)
-                        scheduler.step(val_score)
-
-                        logging.info('Validation Dice score: {}'.format(val_score))
-                        experiment.log({
-                            'learning rate': optimizer.param_groups[0]['lr'],
-                            'validation Dice': val_score,
-                            'images': wandb.Image(images[0].cpu()),
-                            'masks': {
-                                'true': wandb.Image(true_masks[0].float().cpu()),
-                                'pred': wandb.Image(torch.softmax(masks_pred, dim=1)[0].float().cpu()),
-                            },
-                            'step': global_step,
-                            'epoch': epoch,
-                            **histograms
-                        })
-
-        if save_checkpoint:
-            Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
-            torch.save(net.state_dict(), str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch + 1)))
-            logging.info(f'Checkpoint {epoch + 1} saved!')
+cudnn.enabled = False
+gpu0 = int(args['--gpu0'])
 
 
-def get_args():
-    parser = argparse.ArgumentParser(description='Train the UNet on images and target masks')
-    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=5, help='Number of epochs')
-    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=1, help='Batch size')
-    parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=0.00001,
-                        help='Learning rate', dest='lr')
-    parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
-    parser.add_argument('--scale', '-s', type=float, default=0.5, help='Downscaling factor of the images')
-    parser.add_argument('--validation', '-v', dest='val', type=float, default=10.0,
-                        help='Percent of the data that is used as validation (0-100)')
-    parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
+def outS(i):
+    """Given shape of input image as i,i,3 in deeplab-resnet model, this function
+    returns j such that the shape of output blob of is j,j,21 (21 in case of VOC)"""
+    j = int(i)
+    j = (j+1)/2
+    j = int(np.ceil((j+1)/2.0))
+    j = (j+1)/2
+    return j
 
-    return parser.parse_args()
+def read_file(path_to_file):
+    with open(path_to_file) as f:
+        img_list = []
+        for line in f:
+            img_list.append(line[:-1])
+    return img_list
+
+def chunker(seq, size):
+ return (seq[pos:pos+size] for pos in xrange(0,len(seq), size))
+
+def resize_label_batch(label, size):
+    label_resized = np.zeros((size,size,1,label.shape[3]))
+    interp = nn.UpsamplingBilinear2d(size=(size, size))
+    labelVar = Variable(torch.from_numpy(label.transpose(3, 2, 0, 1)))
+    label_resized[:, :, :, :] = interp(labelVar).data.numpy().transpose(2, 3, 1, 0)
+
+    return label_resized
+
+def flip(I,flip_p):
+    if flip_p>0.5:
+        return np.fliplr(I)
+    else:
+        return I
+
+def scale_im(img_temp,scale):
+    new_dims = (  int(img_temp.shape[0]*scale),  int(img_temp.shape[1]*scale)   )
+    return cv2.resize(img_temp,new_dims).astype(float)
+
+def scale_gt(img_temp,scale):
+    new_dims = (  int(img_temp.shape[0]*scale),  int(img_temp.shape[1]*scale)   )
+    return cv2.resize(img_temp,new_dims,interpolation = cv2.INTER_NEAREST).astype(float)
+   
+def get_data_from_chunk_v2(chunk):
+    gt_path =  args['--GTpath']
+    img_path = args['--IMpath']
+
+    scale = random.uniform(0.5, 1.3) #random.uniform(0.5,1.5) does not fit in a Titan X with the present version of pytorch, so we random scaling in the range (0.5,1.3), different than caffe implementation in that caffe used only 4 fixed scales. Refer to read me
+    dim = int(scale*321)
+    images = np.zeros((dim,dim,3,len(chunk)))
+    gt = np.zeros((dim,dim,1,len(chunk)))
+    for i,piece in enumerate(chunk):
+        flip_p = random.uniform(0, 1)
+        img_temp = cv2.imread(os.path.join(img_path,piece+'.jpg')).astype(float)
+        img_temp = cv2.resize(img_temp,(321,321)).astype(float)
+        img_temp = scale_im(img_temp,scale)
+        img_temp[:,:,0] = img_temp[:,:,0] - 104.008
+        img_temp[:,:,1] = img_temp[:,:,1] - 116.669
+        img_temp[:,:,2] = img_temp[:,:,2] - 122.675
+        img_temp = flip(img_temp,flip_p)
+        images[:,:,:,i] = img_temp
+
+        gt_temp = cv2.imread(os.path.join(gt_path,piece+'.png'))[:,:,0]
+        gt_temp[gt_temp == 255] = 0
+        gt_temp = cv2.resize(gt_temp,(321,321) , interpolation = cv2.INTER_NEAREST)
+        gt_temp = scale_gt(gt_temp,scale)
+        gt_temp = flip(gt_temp,flip_p)
+        gt[:,:,0,i] = gt_temp
+        a = outS(321*scale)#41
+        b = outS((321*0.5)*scale+1)#21
+    labels = [resize_label_batch(gt,i) for i in [a,a,b,a]]
+    images = images.transpose((3,2,0,1))
+    images = torch.from_numpy(images).float()
+    return images, labels
 
 
-if __name__ == '__main__':
-    args = get_args()
 
-    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logging.info(f'Using device {device}')
+def loss_calc(out, label,gpu0):
+    """
+    This function returns cross entropy loss for semantic segmentation
+    """
+    # out shape batch_size x channels x h x w -> batch_size x channels x h x w
+    # label shape h x w x 1 x batch_size  -> batch_size x 1 x h x w
+    label = label[:,:,0,:].transpose(2,0,1)
+    label = torch.from_numpy(label).long()
+    label = Variable(label).cuda(gpu0)
+    m = nn.LogSoftmax()
+    criterion = nn.NLLLoss2d()
+    out = m(out)
+    
+    return criterion(out,label)
 
-    # Change here to adapt to your data
-    # n_channels=3 for RGB images
-    # n_classes is the number of probabilities you want to get per pixel
-    net = UNet(n_channels=3, n_classes=2, bilinear=True)
 
-    logging.info(f'Network:\n'
-                 f'\t{net.n_channels} input channels\n'
-                 f'\t{net.n_classes} output channels (classes)\n'
-                 f'\t{"Bilinear" if net.bilinear else "Transposed conv"} upscaling')
+def lr_poly(base_lr, iter,max_iter,power):
+    return base_lr*((1-float(iter)/max_iter)**(power))
 
-    if args.load:
-        net.load_state_dict(torch.load(args.load, map_location=device))
-        logging.info(f'Model loaded from {args.load}')
 
-    net.to(device=device)
-    try:
-        train_net(net=net,
-                  epochs=args.epochs,
-                  batch_size=args.batch_size,
-                  learning_rate=args.lr,
-                  device=device,
-                  img_scale=args.scale,
-                  val_percent=args.val / 100,
-                  amp=args.amp)
-    except KeyboardInterrupt:
-        torch.save(net.state_dict(), 'INTERRUPTED.pth')
-        logging.info('Saved interrupt')
-        sys.exit(0)
+def get_1x_lr_params_NOscale(model):
+    """
+    This generator returns all the parameters of the net except for 
+    the last classification layer. Note that for each batchnorm layer, 
+    requires_grad is set to False in deeplab_resnet.py, therefore this function does not return 
+    any batchnorm parameter
+    """
+    b = []
+
+    b.append(model.Scale.conv1)
+    b.append(model.Scale.bn1)
+    b.append(model.Scale.layer1)
+    b.append(model.Scale.layer2)
+    b.append(model.Scale.layer3)
+    b.append(model.Scale.layer4)
+
+    
+    for i in range(len(b)):
+        for j in b[i].modules():
+            jj = 0
+            for k in j.parameters():
+                jj+=1
+                if k.requires_grad:
+                    yield k
+
+def get_10x_lr_params(model):
+    """
+    This generator returns all the parameters for the last layer of the net,
+    which does the classification of pixel into classes
+    """
+
+    b = []
+    b.append(model.Scale.layer5.parameters())
+
+    for j in range(len(b)):
+        for i in b[j]:
+            yield i
+
+if not os.path.exists('data/snapshots'):
+    os.makedirs('data/snapshots')
+
+
+model = deeplab_resnet.Res_Deeplab(int(args['--NoLabels']))
+
+saved_state_dict = torch.load('data/MS_DeepLab_resnet_pretrained_COCO_init.pth')
+if int(args['--NoLabels'])!=21:
+    for i in saved_state_dict:
+        #Scale.layer5.conv2d_list.3.weight
+        i_parts = i.split('.')
+        if i_parts[1]=='layer5':
+            saved_state_dict[i] = model.state_dict()[i]
+
+model.load_state_dict(saved_state_dict)
+
+max_iter = int(args['--maxIter']) 
+batch_size = 1
+weight_decay = float(args['--wtDecay'])
+base_lr = float(args['--lr'])
+
+model.float()
+model.eval() # use_global_stats = True
+
+img_list = read_file(args['--LISTpath'])
+
+data_list = []
+for i in range(10):  # make list for 10 epocs, though we will only use the first max_iter*batch_size entries of this list
+    np.random.shuffle(img_list)
+    data_list.extend(img_list)
+
+model.cuda(gpu0)
+criterion = nn.CrossEntropyLoss() # use a Classification Cross-Entropy loss
+optimizer = optim.SGD([{'params': get_1x_lr_params_NOscale(model), 'lr': base_lr }, {'params': get_10x_lr_params(model), 'lr': 10*base_lr} ], lr = base_lr, momentum = 0.9,weight_decay = weight_decay)
+
+optimizer.zero_grad()
+data_gen = chunker(data_list, batch_size)
+
+for iter in range(max_iter+1):
+    chunk = data_gen.next()
+
+    images, label = get_data_from_chunk_v2(chunk)
+    images = Variable(images).cuda(gpu0)
+
+    out = model(images)
+    loss = loss_calc(out[0], label[0],gpu0)
+    iter_size = int(args['--iterSize']) 
+    for i in range(len(out)-1):
+        loss = loss + loss_calc(out[i+1],label[i+1],gpu0)
+    loss = loss/iter_size 
+    loss.backward()
+
+    if iter %1 == 0:
+        print 'iter = ',iter, 'of',max_iter,'completed, loss = ', iter_size*(loss.data.cpu().numpy())
+
+    if iter % iter_size  == 0:
+        optimizer.step()
+        lr_ = lr_poly(base_lr,iter,max_iter,0.9)
+        print '(poly lr policy) learning rate',lr_
+        optimizer = optim.SGD([{'params': get_1x_lr_params_NOscale(model), 'lr': lr_ }, {'params': get_10x_lr_params(model), 'lr': 10*lr_} ], lr = lr_, momentum = 0.9,weight_decay = weight_decay)
+        optimizer.zero_grad()
+
+    if iter % 1000 == 0 and iter!=0:
+        print 'taking snapshot ...'
+        torch.save(model.state_dict(),'data/snapshots/VOC12_scenes_'+str(iter)+'.pth')
+end = timeit.timeit()
+print 'time taken ', end-start
